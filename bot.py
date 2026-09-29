@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 import tempfile
+import traceback
 import uuid
 from pathlib import Path
 
@@ -246,8 +247,12 @@ async def join(interaction: discord.Interaction, channel: discord.VoiceChannel |
     await interaction.response.defer(ephemeral=True)
     try:
         await ensure_connected(guild, channel)
-    except (discord.DiscordException, OSError) as exc:
-        await interaction.followup.send(f"接続失敗: {exc}", ephemeral=True)
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        print(f"[join] failed: {type(exc).__name__}: {exc}", flush=True)
+        await interaction.followup.send(
+            f"接続失敗: {type(exc).__name__}: {exc}", ephemeral=True
+        )
         return
 
     auto_read[guild.id] = interaction.channel_id
@@ -292,6 +297,36 @@ async def on_message(message: discord.Message) -> None:
 
 
 @bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    if member.bot or member.guild is None:
+        return
+
+    vc = member.guild.voice_client
+    if not isinstance(vc, discord.VoiceClient) or not vc.is_connected():
+        return
+
+    channel = vc.channel
+    if before.channel != channel and after.channel != channel:
+        return
+
+    humans = [m for m in channel.members if not m.bot]
+    if humans:
+        return
+
+    print(f"[voice] alone in {channel.name}, leaving", flush=True)
+    auto_read.pop(member.guild.id, None)
+    await clear_queue(member.guild.id)
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+    with contextlib.suppress(discord.DiscordException):
+        await vc.disconnect()
+
+
+@bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
     if isinstance(error, commands.CommandNotFound):
         return
@@ -299,6 +334,20 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         await ctx.reply(f"引数不足: {error.param.name}")
         return
     await ctx.reply(f"エラー: {error}")
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    traceback.print_exception(type(error), error, error.__traceback__)
+    cause = error.original if isinstance(error, app_commands.CommandInvokeError) else error
+    msg = f"エラー: {type(cause).__name__}: {cause}"
+    with contextlib.suppress(discord.HTTPException):
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
 
 
 async def main() -> None:

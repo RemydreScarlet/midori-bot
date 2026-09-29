@@ -1,0 +1,4 @@
+[submodule "audio.cpp"]
+	path = audio.cpp
+	url = https://github.com/0xShug0/audio.cpp.git
+	shallow = true

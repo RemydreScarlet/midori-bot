@@ -12,8 +12,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# vendored engine clone (audio.cpp + its models/build)
-audio.cpp/
+# vendored engine clone (git submodule: audio.cpp/)
 
 # generated audio / logs
 *.wav

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -21,6 +22,7 @@ COMMAND_PREFIX = os.environ.get("TTS_PREFIX", "!")
 MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "300"))
 MAX_QUEUE = int(os.environ.get("TTS_MAX_QUEUE", "8"))
 SYNTH_TIMEOUT = float(os.environ.get("TTS_SYNTH_TIMEOUT", "180"))
+TEST_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0") or 0)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -32,6 +34,8 @@ http: aiohttp.ClientSession | None = None
 queues: dict[int, asyncio.Queue] = {}
 workers: dict[int, asyncio.Task] = {}
 guild_options: dict[int, dict] = {}
+auto_read: dict[int, int] = {}
+_synced = False
 
 
 async def synth(text: str, options: dict | None = None) -> bytes:
@@ -63,20 +67,20 @@ async def wait_ready() -> None:
     print("[warn] TTS server not reachable yet", flush=True)
 
 
+async def ensure_connected(guild: discord.Guild, channel: discord.VoiceChannel) -> discord.VoiceClient:
+    vc = guild.voice_client
+    if isinstance(vc, discord.VoiceClient) and vc.is_connected():
+        if vc.channel != channel:
+            await vc.move_to(channel)
+        return vc
+    return await channel.connect(self_deaf=True)
+
+
 async def connect_voice(ctx: commands.Context) -> discord.VoiceClient | None:
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.reply("先にボイスチャンネルに入ってください。")
         return None
-    channel = ctx.author.voice.channel
-    vc = ctx.voice_client
-    if vc and vc.channel == channel:
-        if not vc.is_connected():
-            await vc.connect()
-        return vc
-    if vc:
-        await vc.move_to(channel)
-        return vc
-    return await channel.connect(self_deaf=True)
+    return await ensure_connected(ctx.guild, ctx.author.voice.channel)
 
 
 def make_source(path: str) -> discord.AudioSource:
@@ -131,10 +135,37 @@ def ensure_worker(guild_id: int) -> asyncio.Queue:
     return queue
 
 
+def enqueue(guild_id: int, text: str) -> bool:
+    queue = ensure_worker(guild_id)
+    if queue.qsize() >= MAX_QUEUE:
+        return False
+    queue.put_nowait((text, guild_options.get(guild_id, {}).copy()))
+    return True
+
+
+async def clear_queue(guild_id: int) -> None:
+    queue = queues.get(guild_id)
+    if queue:
+        while not queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+                queue.task_done()
+
+
 @bot.event
 async def on_ready() -> None:
     print(f"[bot] logged in as {bot.user} (id={bot.user and bot.user.id})", flush=True)
     await wait_ready()
+    global _synced
+    if not _synced:
+        _synced = True
+        if TEST_GUILD_ID:
+            guild = discord.Object(id=TEST_GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+        else:
+            synced = await bot.tree.sync()
+        print(f"[bot] synced {len(synced)} slash commands", flush=True)
 
 
 @bot.command(name="tts", help="テキストを読み上げます。例: !tts おはようございます")
@@ -151,39 +182,33 @@ async def tts(ctx: commands.Context, *, text: str) -> None:
         return
 
     queue = ensure_worker(ctx.guild.id)
-    if queue.qsize() >= MAX_QUEUE:
+    if not enqueue(ctx.guild.id, text):
         await ctx.reply(f"キューが満です（{MAX_QUEUE}件）。")
         return
 
-    extra = guild_options.get(ctx.guild.id, {}).copy()
-    queue.put_nowait((text, extra))
     if queue.qsize() == 1:
         await ctx.message.add_reaction("\U0001F50A")
     else:
-        await ctx.message.add_reaction("\u23F3")
+        await ctx.message.add_reaction("⏳")
 
 
 @bot.command(name="stop", help="読み上げを止めてキューを空にします")
 async def stop(ctx: commands.Context) -> None:
-    queue = queues.get(ctx.guild.id)
-    if queue:
-        while not queue.empty():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                queue.get_nowait()
-                queue.task_done()
+    await clear_queue(ctx.guild.id)
     vc = ctx.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
-    await ctx.message.add_reaction("\u23F9")
+    await ctx.message.add_reaction("⏹")
 
 
 @bot.command(name="leave", help="ボイスチャンネルから切断します")
 async def leave(ctx: commands.Context) -> None:
     await stop(ctx)
+    auto_read.pop(ctx.guild.id, None)
     vc = ctx.voice_client
     if vc:
         await vc.disconnect()
-    await ctx.message.add_reaction("\U0001F44B")
+    await ctx.message.add_reaction("👋")
 
 
 @bot.command(name="voice", help="声の指示を設定します。例: !voice 落ち着いた若い女性。| !voice clear")
@@ -199,6 +224,71 @@ async def voice(ctx: commands.Context, *, instruction: str) -> None:
 @bot.command(name="ping", hidden=True)
 async def ping(ctx: commands.Context) -> None:
     await ctx.reply(f"pong (ws: {bot.latency * 1000:.0f}ms)")
+
+
+@bot.tree.command(name="join", description="ボイスチャンネルに入り、このチャンネルの新着メッセージを読み上げます")
+@app_commands.describe(channel="参加するボイスチャンネル（省略時はあなたがいるVC）")
+async def join(interaction: discord.Interaction, channel: discord.VoiceChannel | None = None) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("サーバー内でのみ使えます。", ephemeral=True)
+        return
+
+    if channel is None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                "先にボイスチャンネルに入ってください。", ephemeral=True
+            )
+            return
+        channel = member.voice.channel
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await ensure_connected(guild, channel)
+    except (discord.DiscordException, OSError) as exc:
+        await interaction.followup.send(f"接続失敗: {exc}", ephemeral=True)
+        return
+
+    auto_read[guild.id] = interaction.channel_id
+    ensure_worker(guild.id)
+    await interaction.followup.send(
+        f"{channel.name} に参加しました。このチャンネルのメッセージを読み上げます。"
+    )
+
+
+@bot.tree.command(name="leave", description="ボイスチャンネルから切断し、読み上げを止めます")
+async def leave_slash(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("サーバー内でのみ使えます。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    auto_read.pop(guild.id, None)
+    await clear_queue(guild.id)
+    vc = guild.voice_client
+    if isinstance(vc, discord.VoiceClient):
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        await vc.disconnect()
+    await interaction.followup.send("切断しました。")
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.guild is None or message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    if auto_read.get(message.guild.id) == message.channel.id:
+        text = (message.content or "").strip()
+        if text and not text.startswith(COMMAND_PREFIX):
+            if len(text) > MAX_CHARS:
+                text = text[:MAX_CHARS]
+            enqueue(message.guild.id, text)
+
+    await bot.process_commands(message)
 
 
 @bot.event

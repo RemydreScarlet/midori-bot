@@ -1,0 +1,28 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# vendored engine clone (audio.cpp + its models/build)
+audio.cpp/
+
+# generated audio / logs
+*.wav
+*.mp3
+*.log
+nohup.out
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+*.swp

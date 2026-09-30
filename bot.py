@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import ipaddress
 import os
 import tempfile
 import traceback
 import uuid
+import wave
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -23,7 +27,32 @@ COMMAND_PREFIX = os.environ.get("TTS_PREFIX", "!")
 MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "300"))
 MAX_QUEUE = int(os.environ.get("TTS_MAX_QUEUE", "8"))
 SYNTH_TIMEOUT = float(os.environ.get("TTS_SYNTH_TIMEOUT", "180"))
+VOICES_DIR = Path(os.environ.get("TTS_VOICES_DIR", "voices"))
+MAX_UPLOAD_MB = int(os.environ.get("TTS_MAX_UPLOAD_MB", "25"))
+REF_MAX_SEC = int(os.environ.get("TTS_REF_MAX_SEC", "30"))
 TEST_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0") or 0)
+
+AUDIO_EXTS = {
+    ".aac",
+    ".aif",
+    ".aiff",
+    ".amr",
+    ".flac",
+    ".m4a",
+    ".m4v",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".oga",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm",
+    ".wma",
+}
+MAX_VOICE_REF_BYTES = 5 * 1024 * 1024
+MIN_REF_SEC = 1.0
+DOWNLOAD_TIMEOUT = 120.0
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -37,12 +66,54 @@ workers: dict[int, asyncio.Task] = {}
 guild_options: dict[int, dict] = {}
 auto_read: dict[int, int] = {}
 _synced = False
+_voice_b64_cache: dict[int, tuple[float, str]] = {}
 
 
-async def synth(text: str, options: dict | None = None) -> bytes:
+def clone_wav(user_id: int) -> Path:
+    return VOICES_DIR / f"{user_id}.wav"
+
+
+def tts_is_local() -> bool:
+    host = urlparse(TTS_URL).hostname or ""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def voice_ref_for(user_id: int) -> str | dict | None:
+    path = clone_wav(user_id)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if tts_is_local():
+        return str(path.resolve())
+    cached = _voice_b64_cache.get(user_id)
+    if cached and cached[0] == mtime:
+        return {"type": "base64", "data": cached[1]}
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    _voice_b64_cache[user_id] = (mtime, data)
+    return {"type": "base64", "data": data}
+
+
+def request_extra(guild_id: int, user_id: int) -> dict:
+    extra: dict = {}
+    opts = guild_options.get(guild_id)
+    if opts:
+        extra["options"] = opts.copy()
+    ref = voice_ref_for(user_id)
+    if ref is not None:
+        extra["voice_ref"] = ref
+    return extra
+
+
+async def synth(text: str, extra: dict | None = None) -> bytes:
     payload: dict = {"model": TTS_MODEL, "input": text, "response_format": "wav"}
-    if options:
-        payload["options"] = options
+    if extra:
+        payload.update(extra)
     assert http is not None
     async with http.post(
         f"{TTS_URL}/v1/audio/speech",
@@ -101,6 +172,79 @@ async def play_file(vc: discord.VoiceClient, path: str) -> None:
     await done.wait()
 
 
+async def run_ffmpeg(src: Path, dst: Path) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(src),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "44100",
+        "-c:a",
+        "pcm_s16le",
+        "-t",
+        str(REF_MAX_SEC),
+        str(dst),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        detail = stderr.decode(errors="replace").strip()[:300]
+        raise RuntimeError(f"音声の変換に失敗しました: {detail or 'ffmpeg error'}")
+
+
+def wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as w:
+        rate = w.getframerate()
+        return w.getnframes() / rate if rate else 0.0
+
+
+async def download_and_convert(user_id: int, attachment: discord.Attachment) -> float:
+    if attachment.size > MAX_UPLOAD_MB * 1024 * 1024:
+        raise ValueError(f"ファイルが大きすぎます（{MAX_UPLOAD_MB}MB 以下にしてください）。")
+    ext = Path(attachment.filename or "").suffix.lower()
+    ctype = (attachment.content_type or "").lower()
+    if not (ctype.startswith("audio/") or ctype.startswith("video/") or ext in AUDIO_EXTS):
+        raise ValueError("音声ファイルを添付してください。")
+
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    src = VOICES_DIR / f".tmp_{token}_in{ext or '.bin'}"
+    wav = VOICES_DIR / f".tmp_{token}_out.wav"
+    assert http is not None
+    try:
+        async with http.get(attachment.url, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"添付の取得に失敗しました（HTTP {resp.status}）。")
+            with src.open("wb") as f:
+                async for chunk in resp.content.iter_chunked(1 << 16):
+                    f.write(chunk)
+        await run_ffmpeg(src, wav)
+        try:
+            duration = wav_duration(wav)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("変換後の音声を読み取れませんでした。") from exc
+        if duration < MIN_REF_SEC:
+            raise ValueError(f"参照音声が短すぎます（{MIN_REF_SEC:.0f}秒以上にしてください）。")
+        if not tts_is_local() and wav.stat().st_size > MAX_VOICE_REF_BYTES:
+            raise ValueError("TTSサーバーが遠隔のため 5MiB 以下の参照音声のみ使えます。")
+        os.replace(wav, clone_wav(user_id))
+        _voice_b64_cache.pop(user_id, None)
+        return duration
+    finally:
+        for path in (src, wav):
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
 async def worker(guild_id: int) -> None:
     queue = queues[guild_id]
     while True:
@@ -136,11 +280,11 @@ def ensure_worker(guild_id: int) -> asyncio.Queue:
     return queue
 
 
-def enqueue(guild_id: int, text: str) -> bool:
+def enqueue(guild_id: int, text: str, user_id: int) -> bool:
     queue = ensure_worker(guild_id)
     if queue.qsize() >= MAX_QUEUE:
         return False
-    queue.put_nowait((text, guild_options.get(guild_id, {}).copy()))
+    queue.put_nowait((text, request_extra(guild_id, user_id)))
     return True
 
 
@@ -183,7 +327,7 @@ async def tts(ctx: commands.Context, *, text: str) -> None:
         return
 
     queue = ensure_worker(ctx.guild.id)
-    if not enqueue(ctx.guild.id, text):
+    if not enqueue(ctx.guild.id, text, ctx.author.id):
         await ctx.reply(f"キューが満です（{MAX_QUEUE}件）。")
         return
 
@@ -212,7 +356,10 @@ async def leave(ctx: commands.Context) -> None:
     await ctx.message.add_reaction("👋")
 
 
-@bot.command(name="voice", help="声の指示を設定します。例: !voice 落ち着いた若い女性。| !voice clear")
+@bot.command(
+    name="voice",
+    help="声の指示を設定します。例: !voice 落ち着いた若い女性。| !voice clear（自分のクローン声は /clone）",
+)
 async def voice(ctx: commands.Context, *, instruction: str) -> None:
     if instruction.strip().lower() in {"clear", "none", "なし"}:
         guild_options.pop(ctx.guild.id, None)
@@ -280,6 +427,55 @@ async def leave_slash(interaction: discord.Interaction) -> None:
     await interaction.followup.send("切断しました。")
 
 
+@bot.tree.command(
+    name="clone",
+    description="音声ファイルをアップロードして自分のボイスクローン声を設定します",
+)
+@app_commands.describe(audio="自分の声として登録する音声ファイル", clear="登録を解除する")
+async def clone(
+    interaction: discord.Interaction,
+    audio: discord.Attachment | None = None,
+    clear: bool = False,
+) -> None:
+    user_id = interaction.user.id
+
+    if clear:
+        _voice_b64_cache.pop(user_id, None)
+        path = clone_wav(user_id)
+        removed = path.exists()
+        with contextlib.suppress(OSError):
+            path.unlink()
+        if removed:
+            msg = "クローン声を解除しました。"
+        else:
+            msg = "クローン声は登録されていません。"
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    if audio is None:
+        await interaction.response.send_message(
+            "音声ファイルを添付するか、`clear` を有効にしてください。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        duration = await download_and_convert(user_id, audio)
+    except (ValueError, RuntimeError) as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        print(f"[clone] {type(exc).__name__}: {exc}", flush=True)
+        await interaction.followup.send(f"エラー: {type(exc).__name__}: {exc}", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"あなたのクローン声を登録しました: {audio.filename}（{duration:.1f}秒）。"
+        f"以降、あなたの {COMMAND_PREFIX}tts とあなたのメッセージの読み上げで使われます。",
+        ephemeral=True,
+    )
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.guild is None or message.author.bot:
@@ -291,7 +487,7 @@ async def on_message(message: discord.Message) -> None:
         if text and not text.startswith(COMMAND_PREFIX):
             if len(text) > MAX_CHARS:
                 text = text[:MAX_CHARS]
-            enqueue(message.guild.id, text)
+            enqueue(message.guild.id, text, message.author.id)
 
     await bot.process_commands(message)
 
@@ -354,6 +550,7 @@ async def main() -> None:
     if not DISCORD_TOKEN:
         raise SystemExit("DISCORD_TOKEN is not set (.env)")
     global http
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
     http = aiohttp.ClientSession()
     try:
         await bot.start(DISCORD_TOKEN)
